@@ -9,13 +9,18 @@ export interface VectorPoint {
  */
 class HDBSCAN<T extends VectorPoint> {
   private X: T[];
-  private allNearestNeighbors: Map<string, Map<string, number>>; // adjacency list map(id_from, Map(id_To, weight)) these are the raw edge distances, not the mutual reachability distance
   private mpts: number; // The minimum points to define a core point
-  private coreDistances: Map<string, number>; // Map: id to core distances
-  private mrg: Map<string, Map<string, number>>; // Mutual reachability graph
+  private coreDistances: number[]; // Array of core distances by index
   private mstEdges: { from: string; to: string; weight: number }[]; // mutual reachability graph as an adjacency list
   private distanceFunction: DistanceFunction;
   private idToObject: Map<string, T>;
+  private idToIndex: Map<string, number>;
+  private indexToId: string[];
+  private typedVectors: Float64Array[];
+  private norms: number[];
+  private cumSum: Uint32Array;
+  private distances: Float64Array;
+  private mrgDistances: Float64Array;
 
   /**
    * Creates a new HDBSCAN instance
@@ -25,16 +30,36 @@ class HDBSCAN<T extends VectorPoint> {
    */
   constructor(X: T[], mpts: number, distanceFunction?: DistanceFunction) {
     this.X = X;
-    this.allNearestNeighbors = new Map();
     this.mpts = mpts;
-    this.coreDistances = new Map();
-    this.mrg = new Map();
+    this.coreDistances = [];
+    this.mstEdges = [];
+    this.distanceFunction = distanceFunction ?? cosine;
     this.mstEdges = [];
     this.distanceFunction = distanceFunction ?? cosine;
     this.idToObject = new Map();
     this.X.forEach((p) => {
       this.idToObject.set(p.id, p);
     });
+
+    const N = this.X.length;
+    this.indexToId = this.X.map(p => p.id);
+    this.idToIndex = new Map(this.indexToId.map((id, index) => [id, index]));
+    this.typedVectors = this.X.map(p => new Float64Array(p.vector));
+    this.norms = this.typedVectors.map(vec => {
+      let sum = 0.0;
+      for (let i = 0; i < vec.length; i++) {
+        sum += vec[i] * vec[i];
+      }
+      return Math.sqrt(sum);
+    });
+    this.cumSum = new Uint32Array(N);
+    let sum = 0;
+    for (let i = 0; i < N; i++) {
+      this.cumSum[i] = sum;
+      sum += N - i - 1;
+    }
+    this.distances = new Float64Array((N * (N - 1)) / 2);
+    this.mrgDistances = new Float64Array((N * (N - 1)) / 2);
   }
 
   /**
@@ -76,113 +101,131 @@ class HDBSCAN<T extends VectorPoint> {
   }
 
   private _computeAllNearestNeighbors() {
-    this.X.forEach((from, fromIndex) => {
-      this.allNearestNeighbors.set(from.id, new Map());
-      this.X.forEach((to, toIndex) => {
-        if (
-          fromIndex !== toIndex // Ensure we are not calculating distance to self
-        ) {
-          if (this.allNearestNeighbors.get(to.id)?.has(from.id)) {
-            // already calculated, just need to set the other direction
-            this.allNearestNeighbors
-              .get(from.id)!
-              .set(to.id, this.allNearestNeighbors.get(to.id)!.get(from.id)!);
-          } else {
-            // Calculate the distance from the current point to all other points
-            const distance = this.distanceFunction(from.vector, to.vector);
-            this.allNearestNeighbors.get(from.id)!.set(to.id, distance);
-          }
-        }
-      });
-    });
+    const N = this.X.length;
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const dist = this.computeDistance(i, j);
+        const index = this.cumSum[i] + (j - i - 1);
+        this.distances[index] = dist;
+      }
+    }
+  }
+
+  private computeDistance(i: number, j: number): number {
+    const vecA = this.typedVectors[i];
+    const vecB = this.typedVectors[j];
+    const normA = this.norms[i];
+    const normB = this.norms[j];
+  
+    if (normA === 0 || normB === 0) {
+      return 1.0; // Cosine distance is 1 if one vector is zero (maximal dissimilarity)
+    }
+  
+    let dotProduct = 0.0;
+    const D = vecA.length; // Dimension of vectors
+  
+    // Unroll loop by 8 for performance
+    const D_floor_8 = D - (D % 8);
+    for (let k = 0; k < D_floor_8; k += 8) {
+      dotProduct += vecA[k] * vecB[k] +
+                    vecA[k+1] * vecB[k+1] +
+                    vecA[k+2] * vecB[k+2] +
+                    vecA[k+3] * vecB[k+3] +
+                    vecA[k+4] * vecB[k+4] +
+                    vecA[k+5] * vecB[k+5] +
+                    vecA[k+6] * vecB[k+6] +
+                    vecA[k+7] * vecB[k+7];
+    }
+  
+    // Handle remaining elements if D is not a multiple of 8
+    for (let k = D_floor_8; k < D; k++) {
+      dotProduct += vecA[k] * vecB[k];
+    }
+  
+    const similarity = dotProduct / (normA * normB);
+    
+    // Clamp similarity to [-1, 1] to handle potential floating point inaccuracies
+    const clampedSimilarity = Math.max(-1.0, Math.min(1.0, similarity));
+  
+    return 1.0 - clampedSimilarity; // Cosine distance
   }
 
   private _computeCoreDistances() {
-    // Iterate over all points in the dataset
-    this.allNearestNeighbors.forEach((edgesAtPoint, id) => {
-      const distances = Array.from(edgesAtPoint.values());
-
-      // Sort the array of distances to find the mpts-th smallest distance
-      // TODO: potentially optimize with quickselect
-      distances.sort((a, b) => a - b);
-
-      if (distances.length < this.mpts) {
-        // error check if mpts is greater than the number of points
-        throw new Error(
-          "mpts is greater than the number of points in the dataset"
-        );
+    const N = this.X.length;
+    this.coreDistances = new Array(N);
+    for (let i = 0; i < N; i++) {
+      const distancesForI = [];
+      for (let j = 0; j < i; j++) {
+        const index = this.cumSum[j] + (i - j - 1);
+        distancesForI.push(this.distances[index]);
       }
-      // The core distance is the distance to the mpts-th nearest neighbor
-      let coreDistance = distances[this.mpts - 1]; // Adjusted for zero-based array index.
-      this.coreDistances.set(id, coreDistance);
-    });
+      for (let j = i + 1; j < N; j++) {
+        const index = this.cumSum[i] + (j - i - 1);
+        distancesForI.push(this.distances[index]);
+      }
+      distancesForI.sort((a, b) => a - b);
+      if (distancesForI.length < this.mpts) {
+        throw new Error("mpts is greater than the number of points in the dataset");
+      }
+      this.coreDistances[i] = distancesForI[this.mpts - 1];
+    }
   }
 
   private _constructMRG() {
-    // Prepare graph nodes
-    this.X.forEach((point) => {
-      this.mrg.set(point.id, new Map()); // Each point has a map to others with distances
-    });
+    const N = this.X.length;
+    for (let i = 0; i < N; i++) {
+      const coreDistI = this.coreDistances[i];
+      for (let j = i + 1; j < N; j++) {
+        const coreDistJ = this.coreDistances[j];
+        const distIJ = this.getDistance(i, j);
+        const mrd = Math.max(coreDistI, coreDistJ, distIJ);
+        const index = this.cumSum[i] + (j - i - 1);
+        this.mrgDistances[index] = mrd;
+      }
+    }
+  }
 
-    // Now compute the mutual reachability distance for each pair of points and populate the graph
-    this.allNearestNeighbors.forEach((edgesAtFrom, fromId) => {
-      edgesAtFrom.forEach((distanceTo, toId) => {
-        const mutualReachabilityDistance = Math.max(
-          this.coreDistances.get(fromId)!,
-          this.coreDistances.get(toId)!,
-          distanceTo
-        );
-
-        this.mrg.get(fromId)!.set(toId, mutualReachabilityDistance);
-        //don't need to set the other direction since we're iterating over all edges so the other direction will be added
-      });
-    });
+  private getDistance(i: number, j: number): number {
+    if (i > j) [i, j] = [j, i];
+    const index = this.cumSum[i] + (j - i - 1);
+    return this.distances[index];
   }
 
   private _computeMST() {
-    // Start from the first point (you could start from any)
-    const startId = this.X[0].id;
-    const pq = new PriorityQueue<{ from: string; to: string; weight: number }>(
-      (a, b) => a.weight < b.weight
-    ); // Min-Heap priority queue
-
-    // Initialize the priority queue with all edges from the starting vertex
-    const edgesFromStart = this.mrg.get(startId);
-    edgesFromStart!.forEach((weight, id) => {
-      pq.enqueue({ from: startId, to: id, weight });
-    });
-
-    // Set to keep track of vertices included in the MST
-    const inMST = new Set();
-    inMST.add(startId);
-
-    // Building the MST
-    while (!pq.isEmpty()) {
-      const result = pq.dequeue();
-      if (result === null) {
-        throw new Error("Priority queue dequeued null value");
-      }
-      const { from, to, weight } = result;
-
-      // Check if the 'to' vertex is already included in the MST
-      if (!inMST.has(to)) {
-        inMST.add(to);
-
-        //add edge to mstEdges
-        this.mstEdges.push({ from, to, weight });
-
-        // Add all edges from the 'to' vertex to the priority queue
-        const edgesFromTo = this.mrg.get(to);
-        edgesFromTo!.forEach((nextWeight, nextId) => {
-          if (!inMST.has(nextId)) {
-            pq.enqueue({ from: to, to: nextId, weight: nextWeight });
-          }
-        });
+    const N = this.X.length;
+    if (N === 0) return;
+    const startIndex = 0;
+    const pq = new PriorityQueue<{ from: number; to: number; weight: number }>((a, b) => a.weight < b.weight);
+    for (let to = 0; to < N; to++) {
+      if (to !== startIndex) {
+        const weight = this.getMRD(startIndex, to);
+        pq.enqueue({ from: startIndex, to, weight });
       }
     }
-
-    //sort the mstEdges by weight in ascending order
+    const inMST = new Set([startIndex]);
+    this.mstEdges = [];
+    while (!pq.isEmpty()) {
+      const edge = pq.dequeue();
+      if (edge === null) continue;
+      const { from, to, weight } = edge;
+      if (!inMST.has(to)) {
+        inMST.add(to);
+        this.mstEdges.push({ from: this.indexToId[from], to: this.indexToId[to], weight });
+        for (let next = 0; next < N; next++) {
+          if (!inMST.has(next)) {
+            const nextWeight = this.getMRD(to, next);
+            pq.enqueue({ from: to, to: next, weight: nextWeight });
+          }
+        }
+      }
+    }
     this.mstEdges.sort((a, b) => a.weight - b.weight);
+  }
+
+  private getMRD(i: number, j: number): number {
+    if (i > j) [i, j] = [j, i];
+    const index = this.cumSum[i] + (j - i - 1);
+    return this.mrgDistances[index];
   }
 
   private _extractHDBSCANHierarchy() {
@@ -425,6 +468,17 @@ class PriorityQueue<T> {
 
   isEmpty(): boolean {
     return this._heap.length === 0;
+  }
+
+  size(): number {
+    return this._heap.length;
+  }
+
+  peek(): T | null {
+    if (this.isEmpty()) {
+      return null;
+    }
+    return this._heap[0];
   }
 
   private _siftUp(): void {
