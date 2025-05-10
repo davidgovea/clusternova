@@ -12,7 +12,6 @@ class HDBSCAN<T extends VectorPoint> {
   private coreDistances: number[];
   private mstEdges: { from: string; to: string; weight: number }[];
   private idToObject: Map<string, T>;
-  private idToIndex: Map<string, number>;
   private indexToId: string[];
   private distancesArray: number[][];
   private mrdArray: number[][];
@@ -28,35 +27,49 @@ class HDBSCAN<T extends VectorPoint> {
     });
     const N = this.X.length;
     this.indexToId = this.X.map(p => p.id);
-    this.idToIndex = new Map(this.indexToId.map((id, index) => [id, index]));
     this.distancesArray = [];
     this.mrdArray = [];
   }
 
   run(): { clusters: T[][]; outliers: T[] } {
-    if (this.X.length === 0) {
+    const N = this.X.length; // Moved N earlier
+    if (N === 0) {
       return { clusters: [], outliers: [] };
     }
-    const N = this.X.length;
 
     if (this.mpts <= 0) {
         throw new Error("mpts must be positive.");
     }
-    if (this.mpts >= N && N > 0) {
+    // N > 0 is guaranteed here if mpts < N
+    if (this.mpts >= N) {
         throw new Error(`mpts (${this.mpts}) must be less than the number of data points (${N}) for core distance calculation.`);
     }
 
     try {
       console.time('HDBSCAN: Distance Matrix');
-      const vectorsData = this.X.map(p => p.vector);
-      const vectorsTensor = tf.tensor2d(vectorsData);
+      // const vectorsData = this.X.map(p => p.vector); // Old line: creates number[][]
+
+      // New: Prepare flat Float32Array
+      const D = this.X[0].vector.length; // Safe because N > 0 from checks above
+      const flatVectorsData = new Float32Array(N * D);
+      for (let i = 0; i < N; i++) {
+        const vector = this.X[i].vector;
+        if (vector.length !== D) {
+            // This case should ideally be caught earlier or prevented by data validation.
+            throw new Error(`Inconsistent vector dimensions. Expected ${D}, got ${vector.length} for vector ID ${this.X[i].id}`);
+        }
+        for (let j = 0; j < D; j++) {
+          flatVectorsData[i * D + j] = vector[j];
+        }
+      }
+      const vectorsTensor = tf.tensor2d(flatVectorsData, [N, D]); // Use flat array and shape
       const normsTensor = tf.norm(vectorsTensor, 'euclidean', 1, true);
       const zeroNormMask = tf.equal(normsTensor, tf.scalar(0));
       const safeNorms = tf.where(zeroNormMask, tf.onesLike(normsTensor), normsTensor);
       const normalizedVectors = vectorsTensor.div(safeNorms);
       const dotProducts = tf.matMul(normalizedVectors, normalizedVectors, false, true);
       const distancesTensor = tf.sub(tf.scalar(1), dotProducts);
-      this.distancesArray = distancesTensor.arraySync();
+      this.distancesArray = distancesTensor.arraySync() as number[][];
 
       for (let i = 0; i < N; i++) {
         for (let j = 0; j < N; j++) {
@@ -81,7 +94,7 @@ class HDBSCAN<T extends VectorPoint> {
       const coreDistancesTransposed = coreDistancesTensor2D.tile([1, N]).transpose();
       const maxCoreDistances = tf.maximum(coreDistancesTiled, coreDistancesTransposed);
       const mrdTensor = tf.maximum(maxCoreDistances, distancesTensor);
-      this.mrdArray = mrdTensor.arraySync();
+      this.mrdArray = mrdTensor.arraySync() as number[][];
       console.timeEnd('HDBSCAN: MRD Matrix');
 
       vectorsTensor.dispose();
