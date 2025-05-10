@@ -13,7 +13,7 @@ class HDBSCAN<T extends VectorPoint> {
   private mstEdges: { from: string; to: string; weight: number }[];
   private idToObject: Map<string, T>;
   private indexToId: string[];
-  private distancesArray: number[][];
+  private distancesArray: number[][] | null;
   private mrdArray: number[][];
 
   constructor(X: T[], mpts: number) {
@@ -27,7 +27,7 @@ class HDBSCAN<T extends VectorPoint> {
     });
     const N = this.X.length;
     this.indexToId = this.X.map(p => p.id);
-    this.distancesArray = [];
+    this.distancesArray = null;
     this.mrdArray = [];
   }
 
@@ -69,20 +69,15 @@ class HDBSCAN<T extends VectorPoint> {
       const normalizedVectors = vectorsTensor.div(safeNorms);
       const dotProducts = tf.matMul(normalizedVectors, normalizedVectors, false, true);
       const distancesTensor = tf.sub(tf.scalar(1), dotProducts);
-      this.distancesArray = distancesTensor.arraySync() as number[][];
+      
+      // Handle NaNs in distancesTensor using TensorFlow.js operations
+      const nanFixedDistancesTensor = tf.where(tf.isNaN(distancesTensor), tf.onesLike(distancesTensor), distancesTensor);
 
-      for (let i = 0; i < N; i++) {
-        for (let j = 0; j < N; j++) {
-          if (isNaN(this.distancesArray[i][j])) {
-            this.distancesArray[i][j] = 1.0;
-          }
-        }
-        this.distancesArray[i][i] = 0.0;
-      }
       console.timeEnd('HDBSCAN: Distance Matrix');
 
       console.time('HDBSCAN: Core Distances');
-      const negDistancesTensor = distancesTensor.neg();
+      // Use nanFixedDistancesTensor for core distance calculation
+      const negDistancesTensor = nanFixedDistancesTensor.neg();
       const { values: smallestNegatedDistances } = tf.topk(negDistancesTensor, this.mpts + 1, true);
       const coreDistancesTensor = smallestNegatedDistances.gather([this.mpts], 1).neg();
       this.coreDistances = Array.from(coreDistancesTensor.dataSync());
@@ -103,7 +98,10 @@ class HDBSCAN<T extends VectorPoint> {
       safeNorms.dispose();
       normalizedVectors.dispose();
       dotProducts.dispose();
-      distancesTensor.dispose();
+      distancesTensor.dispose(); // Dispose original distancesTensor
+      if (nanFixedDistancesTensor !== distancesTensor) { // Dispose if it's a new tensor
+        nanFixedDistancesTensor.dispose();
+      }
       negDistancesTensor.dispose();
       smallestNegatedDistances.dispose();
       coreDistancesTensor.dispose();
@@ -142,7 +140,14 @@ class HDBSCAN<T extends VectorPoint> {
     if (i < 0 || i >= this.X.length || j < 0 || j >= this.X.length) {
         throw new Error("Invalid indices for getDistance");
     }
-    return this.distancesArray[i][j];
+    if (this.distancesArray) {
+      return this.distancesArray[i][j];
+    }
+    // If distancesArray is null, compute on-the-fly
+    if (!this.X[i] || !this.X[j]) {
+        throw new Error(`Invalid vector data for indices ${i} or ${j} in getDistance`);
+    }
+    return cosine(this.X[i].vector, this.X[j].vector);
   }
 
   private getMRD(i: number, j: number): number {
