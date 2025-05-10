@@ -1,3 +1,5 @@
+import * as tf from '@tensorflow/tfjs-node';
+
 export type DistanceFunction = (pointA: number[], pointB: number[]) => number;
 export interface VectorPoint {
   id: string;
@@ -12,15 +14,10 @@ class HDBSCAN<T extends VectorPoint> {
   private mpts: number; // The minimum points to define a core point
   private coreDistances: number[]; // Array of core distances by index
   private mstEdges: { from: string; to: string; weight: number }[]; // mutual reachability graph as an adjacency list
-  private distanceFunction: DistanceFunction;
   private idToObject: Map<string, T>;
   private idToIndex: Map<string, number>;
   private indexToId: string[];
-  private typedVectors: Float64Array[];
-  private norms: number[];
-  private cumSum: Uint32Array;
-  private distances: Float64Array;
-  private mrgDistances: Float64Array;
+  private distancesArray: number[][]; // Added: Stores the full N x N distance matrix
 
   /**
    * Creates a new HDBSCAN instance
@@ -28,14 +25,11 @@ class HDBSCAN<T extends VectorPoint> {
    * @param mpts - Minimum points required to form a dense region (minimum cluster size)
    * @param distanceFunction - Optional function to calculate distance between points (defaults to cosine distance)
    */
-  constructor(X: T[], mpts: number, distanceFunction?: DistanceFunction) {
+  constructor(X: T[], mpts: number) {
     this.X = X;
     this.mpts = mpts;
     this.coreDistances = [];
     this.mstEdges = [];
-    this.distanceFunction = distanceFunction ?? cosine;
-    this.mstEdges = [];
-    this.distanceFunction = distanceFunction ?? cosine;
     this.idToObject = new Map();
     this.X.forEach((p) => {
       this.idToObject.set(p.id, p);
@@ -44,22 +38,7 @@ class HDBSCAN<T extends VectorPoint> {
     const N = this.X.length;
     this.indexToId = this.X.map(p => p.id);
     this.idToIndex = new Map(this.indexToId.map((id, index) => [id, index]));
-    this.typedVectors = this.X.map(p => new Float64Array(p.vector));
-    this.norms = this.typedVectors.map(vec => {
-      let sum = 0.0;
-      for (let i = 0; i < vec.length; i++) {
-        sum += vec[i] * vec[i];
-      }
-      return Math.sqrt(sum);
-    });
-    this.cumSum = new Uint32Array(N);
-    let sum = 0;
-    for (let i = 0; i < N; i++) {
-      this.cumSum[i] = sum;
-      sum += N - i - 1;
-    }
-    this.distances = new Float64Array((N * (N - 1)) / 2);
-    this.mrgDistances = new Float64Array((N * (N - 1)) / 2);
+    this.distancesArray = []; // Added initialization
   }
 
   /**
@@ -73,10 +52,58 @@ class HDBSCAN<T extends VectorPoint> {
     if (this.X.length === 0) {
       return { clusters: [], outliers: [] };
     }
+    const N = this.X.length;
+
+    if (this.mpts <= 0) {
+        throw new Error("mpts must be positive.");
+    }
+    if (this.mpts >= N && N > 0) {
+        throw new Error(`mpts (${this.mpts}) must be less than the number of data points (${N}) for core distance calculation.`);
+    }
+
     try {
-      this._computeAllNearestNeighbors();
-      this._computeCoreDistances();
-      this._constructMRG();
+      // Compute distance matrix using TensorFlow.js
+      const vectorsData = this.X.map(p => p.vector);
+      const vectorsTensor = tf.tensor2d(vectorsData);
+      const normsTensor = tf.norm(vectorsTensor, 'euclidean', 1, true); // keepdims=true
+
+      const zeroNormMask = tf.equal(normsTensor, tf.scalar(0));
+      const safeNorms = tf.where(zeroNormMask, tf.onesLike(normsTensor), normsTensor);
+      const normalizedVectors = vectorsTensor.div(safeNorms);
+
+      const dotProducts = tf.matMul(normalizedVectors, normalizedVectors, false, true);
+      const distancesTensor = tf.sub(tf.scalar(1), dotProducts);
+
+      this.distancesArray = distancesTensor.arraySync() as number[][];
+
+      // Post-process distancesArray for NaNs and self-distances
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+          if (isNaN(this.distancesArray[i][j])) {
+            this.distancesArray[i][j] = 1.0; // Max distance for NaNs
+          }
+        }
+        this.distancesArray[i][i] = 0.0; // Ensure self-distance is 0
+      }
+      
+      // Compute core distances using TensorFlow.js
+      const negDistancesTensor = distancesTensor.neg();
+      const { values: smallestNegatedDistances } = tf.topk(negDistancesTensor, this.mpts + 1, true);
+      const coreDistancesTensor = smallestNegatedDistances.gather([this.mpts], 1).neg();
+      this.coreDistances = Array.from(coreDistancesTensor.dataSync());
+
+      // Dispose TensorFlow.js tensors
+      vectorsTensor.dispose();
+      normsTensor.dispose();
+      zeroNormMask.dispose();
+      safeNorms.dispose();
+      normalizedVectors.dispose();
+      dotProducts.dispose();
+      distancesTensor.dispose();
+      negDistancesTensor.dispose();
+      smallestNegatedDistances.dispose();
+      coreDistancesTensor.dispose();
+
       this._computeMST();
       const { clusters, outliers } = this._extractHDBSCANHierarchy();
 
@@ -95,100 +122,20 @@ class HDBSCAN<T extends VectorPoint> {
       };
     } catch (e) {
       console.error("Error in HDBSCAN:", e);
-      //rethrow
       throw e;
     }
   }
 
-  private _computeAllNearestNeighbors() {
-    const N = this.X.length;
-    for (let i = 0; i < N; i++) {
-      for (let j = i + 1; j < N; j++) {
-        const dist = this.computeDistance(i, j);
-        const index = this.cumSum[i] + (j - i - 1);
-        this.distances[index] = dist;
-      }
-    }
-  }
-
-  private computeDistance(i: number, j: number): number {
-    const vecA = this.typedVectors[i];
-    const vecB = this.typedVectors[j];
-    const normA = this.norms[i];
-    const normB = this.norms[j];
-  
-    if (normA === 0 || normB === 0) {
-      return 1.0; // Cosine distance is 1 if one vector is zero (maximal dissimilarity)
-    }
-  
-    let dotProduct = 0.0;
-    const D = vecA.length; // Dimension of vectors
-  
-    // Unroll loop by 8 for performance
-    const D_floor_8 = D - (D % 8);
-    for (let k = 0; k < D_floor_8; k += 8) {
-      dotProduct += vecA[k] * vecB[k] +
-                    vecA[k+1] * vecB[k+1] +
-                    vecA[k+2] * vecB[k+2] +
-                    vecA[k+3] * vecB[k+3] +
-                    vecA[k+4] * vecB[k+4] +
-                    vecA[k+5] * vecB[k+5] +
-                    vecA[k+6] * vecB[k+6] +
-                    vecA[k+7] * vecB[k+7];
-    }
-  
-    // Handle remaining elements if D is not a multiple of 8
-    for (let k = D_floor_8; k < D; k++) {
-      dotProduct += vecA[k] * vecB[k];
-    }
-  
-    const similarity = dotProduct / (normA * normB);
-    
-    // Clamp similarity to [-1, 1] to handle potential floating point inaccuracies
-    const clampedSimilarity = Math.max(-1.0, Math.min(1.0, similarity));
-  
-    return 1.0 - clampedSimilarity; // Cosine distance
-  }
-
-  private _computeCoreDistances() {
-    const N = this.X.length;
-    this.coreDistances = new Array(N);
-    for (let i = 0; i < N; i++) {
-      const distancesForI = [];
-      for (let j = 0; j < i; j++) {
-        const index = this.cumSum[j] + (i - j - 1);
-        distancesForI.push(this.distances[index]);
-      }
-      for (let j = i + 1; j < N; j++) {
-        const index = this.cumSum[i] + (j - i - 1);
-        distancesForI.push(this.distances[index]);
-      }
-      distancesForI.sort((a, b) => a - b);
-      if (distancesForI.length < this.mpts) {
-        throw new Error("mpts is greater than the number of points in the dataset");
-      }
-      this.coreDistances[i] = distancesForI[this.mpts - 1];
-    }
-  }
-
-  private _constructMRG() {
-    const N = this.X.length;
-    for (let i = 0; i < N; i++) {
-      const coreDistI = this.coreDistances[i];
-      for (let j = i + 1; j < N; j++) {
-        const coreDistJ = this.coreDistances[j];
-        const distIJ = this.getDistance(i, j);
-        const mrd = Math.max(coreDistI, coreDistJ, distIJ);
-        const index = this.cumSum[i] + (j - i - 1);
-        this.mrgDistances[index] = mrd;
-      }
-    }
-  }
-
   private getDistance(i: number, j: number): number {
-    if (i > j) [i, j] = [j, i];
-    const index = this.cumSum[i] + (j - i - 1);
-    return this.distances[index];
+    if (i < 0 || i >= this.X.length || j < 0 || j >= this.X.length) {
+        throw new Error("Invalid indices for getDistance");
+    }
+    return this.distancesArray[i][j];
+  }
+
+  private getMRD(i: number, j: number): number {
+    const distIJ = this.getDistance(i, j);
+    return Math.max(this.coreDistances[i], this.coreDistances[j], distIJ);
   }
 
   private _computeMST() {
@@ -220,12 +167,6 @@ class HDBSCAN<T extends VectorPoint> {
       }
     }
     this.mstEdges.sort((a, b) => a.weight - b.weight);
-  }
-
-  private getMRD(i: number, j: number): number {
-    if (i > j) [i, j] = [j, i];
-    const index = this.cumSum[i] + (j - i - 1);
-    return this.mrgDistances[index];
   }
 
   private _extractHDBSCANHierarchy() {
