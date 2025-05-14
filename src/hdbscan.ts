@@ -1,65 +1,127 @@
+import * as tf from '@tensorflow/tfjs-node';
+import { UnionFind, cosine } from './utils.ts';
 export type DistanceFunction = (pointA: number[], pointB: number[]) => number;
 export interface VectorPoint {
   id: string;
   vector: number[];
 }
-/**
- * HDBSCAN (Hierarchical Density-Based Spatial Clustering of Applications with Noise) implementation
- * @template T - Type of data points, must include 'id' and 'vector' properties
- */
+
 class HDBSCAN<T extends VectorPoint> {
   private X: T[];
-  private allNearestNeighbors: Map<string, Map<string, number>>; // adjacency list map(id_from, Map(id_To, weight)) these are the raw edge distances, not the mutual reachability distance
-  private mpts: number; // The minimum points to define a core point
-  private coreDistances: Map<string, number>; // Map: id to core distances
-  private mrg: Map<string, Map<string, number>>; // Mutual reachability graph
-  private mstEdges: { from: string; to: string; weight: number }[]; // mutual reachability graph as an adjacency list
-  private distanceFunction: DistanceFunction;
+  private mpts: number;
+  private coreDistances: number[];
+  private mstEdges: { from: string; to: string; weight: number }[];
   private idToObject: Map<string, T>;
+  private indexToId: string[];
+  private distancesArray: number[][] | null;
+  private mrdArray: number[][];
 
-  /**
-   * Creates a new HDBSCAN instance
-   * @param X - Array of data points to cluster
-   * @param mpts - Minimum points required to form a dense region (minimum cluster size)
-   * @param distanceFunction - Optional function to calculate distance between points (defaults to cosine distance)
-   */
-  constructor(X: T[], mpts: number, distanceFunction?: DistanceFunction) {
+  constructor(X: T[], mpts: number) {
     this.X = X;
-    this.allNearestNeighbors = new Map();
     this.mpts = mpts;
-    this.coreDistances = new Map();
-    this.mrg = new Map();
+    this.coreDistances = [];
     this.mstEdges = [];
-    this.distanceFunction = distanceFunction ?? cosine;
     this.idToObject = new Map();
     this.X.forEach((p) => {
       this.idToObject.set(p.id, p);
     });
+    const N = this.X.length;
+    this.indexToId = this.X.map(p => p.id);
+    this.distancesArray = null;
+    this.mrdArray = [];
   }
 
-  /**
-   * Runs the HDBSCAN clustering algorithm
-   * @returns Object containing clusters and outliers
-   * @returns {T[][]} clusters - Array of clusters, where each cluster is an array of data points
-   * @returns {T[]} outliers - Array of data points that don't belong to any cluster
-   * @throws {Error} If an error occurs during clustering
-   */
   run(): { clusters: T[][]; outliers: T[] } {
-    if (this.X.length === 0) {
+    const N = this.X.length; // Moved N earlier
+    if (N === 0) {
       return { clusters: [], outliers: [] };
     }
-    try {
-      this._computeAllNearestNeighbors();
-      this._computeCoreDistances();
-      this._constructMRG();
-      this._computeMST();
-      const { clusters, outliers } = this._extractHDBSCANHierarchy();
 
-      // Transform IDs into original objects
+    if (this.mpts <= 0) {
+        throw new Error("mpts must be positive.");
+    }
+    // N > 0 is guaranteed here if mpts < N
+    if (this.mpts >= N) {
+        throw new Error(`mpts (${this.mpts}) must be less than the number of data points (${N}) for core distance calculation.`);
+    }
+
+    try {
+      console.time('HDBSCAN: Distance Matrix');
+      // const vectorsData = this.X.map(p => p.vector); // Old line: creates number[][]
+
+      // New: Prepare flat Float32Array
+      const D = this.X[0].vector.length; // Safe because N > 0 from checks above
+      const flatVectorsData = new Float32Array(N * D);
+      for (let i = 0; i < N; i++) {
+        const vector = this.X[i].vector;
+        if (vector.length !== D) {
+            // This case should ideally be caught earlier or prevented by data validation.
+            throw new Error(`Inconsistent vector dimensions. Expected ${D}, got ${vector.length} for vector ID ${this.X[i].id}`);
+        }
+        for (let j = 0; j < D; j++) {
+          flatVectorsData[i * D + j] = vector[j];
+        }
+      }
+      const vectorsTensor = tf.tensor2d(flatVectorsData, [N, D]); // Use flat array and shape
+      const normsTensor = tf.norm(vectorsTensor, 'euclidean', 1, true);
+      const zeroNormMask = tf.equal(normsTensor, tf.scalar(0));
+      const safeNorms = tf.where(zeroNormMask, tf.onesLike(normsTensor), normsTensor);
+      const normalizedVectors = vectorsTensor.div(safeNorms);
+      const dotProducts = tf.matMul(normalizedVectors, normalizedVectors, false, true);
+      const distancesTensor = tf.sub(tf.scalar(1), dotProducts);
+      
+      // Handle NaNs in distancesTensor using TensorFlow.js operations
+      const nanFixedDistancesTensor = tf.where(tf.isNaN(distancesTensor), tf.onesLike(distancesTensor), distancesTensor);
+
+      console.timeEnd('HDBSCAN: Distance Matrix');
+
+      console.time('HDBSCAN: Core Distances');
+      // Use nanFixedDistancesTensor for core distance calculation
+      const negDistancesTensor = nanFixedDistancesTensor.neg();
+      const { values: smallestNegatedDistances } = tf.topk(negDistancesTensor, this.mpts + 1, true);
+      const coreDistancesTensor = smallestNegatedDistances.gather([this.mpts], 1).neg();
+      this.coreDistances = Array.from(coreDistancesTensor.dataSync());
+      console.timeEnd('HDBSCAN: Core Distances');
+
+      console.time('HDBSCAN: MRD Matrix');
+      const coreDistancesTensor2D = tf.tensor2d(this.coreDistances, [N, 1]);
+      const coreDistancesTiled = coreDistancesTensor2D.tile([1, N]);
+      const coreDistancesTransposed = coreDistancesTensor2D.tile([1, N]).transpose();
+      const maxCoreDistances = tf.maximum(coreDistancesTiled, coreDistancesTransposed);
+      const mrdTensor = tf.maximum(maxCoreDistances, distancesTensor);
+      this.mrdArray = mrdTensor.arraySync() as number[][];
+      console.timeEnd('HDBSCAN: MRD Matrix');
+
+      vectorsTensor.dispose();
+      normsTensor.dispose();
+      zeroNormMask.dispose();
+      safeNorms.dispose();
+      normalizedVectors.dispose();
+      dotProducts.dispose();
+      distancesTensor.dispose(); // Dispose original distancesTensor
+      if (nanFixedDistancesTensor !== distancesTensor) { // Dispose if it's a new tensor
+        nanFixedDistancesTensor.dispose();
+      }
+      negDistancesTensor.dispose();
+      smallestNegatedDistances.dispose();
+      coreDistancesTensor.dispose();
+      coreDistancesTensor2D.dispose();
+      coreDistancesTiled.dispose();
+      coreDistancesTransposed.dispose();
+      maxCoreDistances.dispose();
+      mrdTensor.dispose();
+
+      console.time('HDBSCAN: MST Computation');
+      this._computeMST();
+      console.timeEnd('HDBSCAN: MST Computation');
+
+      console.time('HDBSCAN: Hierarchy Extraction');
+      const { clusters, outliers } = this._extractHDBSCANHierarchy();
+      console.timeEnd('HDBSCAN: Hierarchy Extraction');
+
       const clustersWithOriginalObjs = clusters.map((cluster) =>
         cluster.map((id) => this.idToObject.get(id)!)
       );
-
       const outliersWithOriginalObjs = outliers.map(
         (id) => this.idToObject.get(id)!
       );
@@ -70,144 +132,97 @@ class HDBSCAN<T extends VectorPoint> {
       };
     } catch (e) {
       console.error("Error in HDBSCAN:", e);
-      //rethrow
       throw e;
     }
   }
 
-  private _computeAllNearestNeighbors() {
-    this.X.forEach((from, fromIndex) => {
-      this.allNearestNeighbors.set(from.id, new Map());
-      this.X.forEach((to, toIndex) => {
-        if (
-          fromIndex !== toIndex // Ensure we are not calculating distance to self
-        ) {
-          if (this.allNearestNeighbors.get(to.id)?.has(from.id)) {
-            // already calculated, just need to set the other direction
-            this.allNearestNeighbors
-              .get(from.id)!
-              .set(to.id, this.allNearestNeighbors.get(to.id)!.get(from.id)!);
-          } else {
-            // Calculate the distance from the current point to all other points
-            const distance = this.distanceFunction(from.vector, to.vector);
-            this.allNearestNeighbors.get(from.id)!.set(to.id, distance);
-          }
-        }
-      });
-    });
+  private getDistance(i: number, j: number): number {
+    if (i < 0 || i >= this.X.length || j < 0 || j >= this.X.length) {
+        throw new Error("Invalid indices for getDistance");
+    }
+    if (this.distancesArray) {
+      return this.distancesArray[i][j];
+    }
+    // If distancesArray is null, compute on-the-fly
+    if (!this.X[i] || !this.X[j]) {
+        throw new Error(`Invalid vector data for indices ${i} or ${j} in getDistance`);
+    }
+    return cosine(this.X[i].vector, this.X[j].vector);
   }
 
-  private _computeCoreDistances() {
-    // Iterate over all points in the dataset
-    this.allNearestNeighbors.forEach((edgesAtPoint, id) => {
-      const distances = Array.from(edgesAtPoint.values());
-
-      // Sort the array of distances to find the mpts-th smallest distance
-      // TODO: potentially optimize with quickselect
-      distances.sort((a, b) => a - b);
-
-      if (distances.length < this.mpts) {
-        // error check if mpts is greater than the number of points
-        throw new Error(
-          "mpts is greater than the number of points in the dataset"
-        );
-      }
-      // The core distance is the distance to the mpts-th nearest neighbor
-      let coreDistance = distances[this.mpts - 1]; // Adjusted for zero-based array index.
-      this.coreDistances.set(id, coreDistance);
-    });
-  }
-
-  private _constructMRG() {
-    // Prepare graph nodes
-    this.X.forEach((point) => {
-      this.mrg.set(point.id, new Map()); // Each point has a map to others with distances
-    });
-
-    // Now compute the mutual reachability distance for each pair of points and populate the graph
-    this.allNearestNeighbors.forEach((edgesAtFrom, fromId) => {
-      edgesAtFrom.forEach((distanceTo, toId) => {
-        const mutualReachabilityDistance = Math.max(
-          this.coreDistances.get(fromId)!,
-          this.coreDistances.get(toId)!,
-          distanceTo
-        );
-
-        this.mrg.get(fromId)!.set(toId, mutualReachabilityDistance);
-        //don't need to set the other direction since we're iterating over all edges so the other direction will be added
-      });
-    });
+  private getMRD(i: number, j: number): number {
+    if (i < 0 || i >= this.X.length || j < 0 || j >= this.X.length) {
+      throw new Error("Invalid indices for getMRD");
+    }
+    return this.mrdArray[i][j];
   }
 
   private _computeMST() {
-    // Start from the first point (you could start from any)
-    const startId = this.X[0].id;
-    const pq = new PriorityQueue<{ from: string; to: string; weight: number }>(
-      (a, b) => a.weight < b.weight
-    ); // Min-Heap priority queue
+    const N = this.X.length;
+    if (N === 0) return;
 
-    // Initialize the priority queue with all edges from the starting vertex
-    const edgesFromStart = this.mrg.get(startId);
-    edgesFromStart!.forEach((weight, id) => {
-      pq.enqueue({ from: startId, to: id, weight });
-    });
+    const key = new Array(N).fill(Infinity);
+    const parent = new Array(N).fill(-1);
+    const inMST = new Array(N).fill(false);
+    this.mstEdges = [];
 
-    // Set to keep track of vertices included in the MST
-    const inMST = new Set();
-    inMST.add(startId);
+    key[0] = 0; // Start with the first vertex
 
-    // Building the MST
-    while (!pq.isEmpty()) {
-      const result = pq.dequeue();
-      if (result === null) {
-        throw new Error("Priority queue dequeued null value");
+    for (let count = 0; count < N; count++) {
+      let minKey = Infinity;
+      let u = -1;
+
+      // Find vertex with minimum key not yet in MST
+      for (let i = 0; i < N; i++) {
+        if (!inMST[i] && key[i] < minKey) {
+          minKey = key[i];
+          u = i;
+        }
       }
-      const { from, to, weight } = result;
 
-      // Check if the 'to' vertex is already included in the MST
-      if (!inMST.has(to)) {
-        inMST.add(to);
+      if (u === -1) {
+        // Should not happen in a connected graph (MRD matrix implies complete graph)
+        console.warn("MST construction failed to find next vertex. Graph might be disconnected.");
+        break;
+      }
 
-        //add edge to mstEdges
-        this.mstEdges.push({ from, to, weight });
+      inMST[u] = true;
 
-        // Add all edges from the 'to' vertex to the priority queue
-        const edgesFromTo = this.mrg.get(to);
-        edgesFromTo!.forEach((nextWeight, nextId) => {
-          if (!inMST.has(nextId)) {
-            pq.enqueue({ from: to, to: nextId, weight: nextWeight });
-          }
+      // Add edge to MST, except for the first vertex (which has no parent)
+      if (parent[u] !== -1) {
+        this.mstEdges.push({
+          from: this.indexToId[parent[u]],
+          to: this.indexToId[u],
+          weight: key[u],
         });
       }
-    }
 
-    //sort the mstEdges by weight in ascending order
+      // Update keys of adjacent vertices
+      for (let v = 0; v < N; v++) {
+        if (!inMST[v] && this.mrdArray[u][v] < key[v]) {
+          parent[v] = u;
+          key[v] = this.mrdArray[u][v];
+        }
+      }
+    }
     this.mstEdges.sort((a, b) => a.weight - b.weight);
   }
 
   private _extractHDBSCANHierarchy() {
-    // Initialize the union-find structure
     const uf = new UnionFind(this.X.map((point) => point.id));
-
-    // Array to store the hierarchy steps, where each element is an object:
     const hierarchy: {
-      childrenClusters: number[] | null; // [two children index in the hierarchy (number)]
-      elements: string[]; // [ids] (we also get the size of the cluster here),
+      childrenClusters: number[] | null;
+      elements: string[];
       lambdaPs: number[];
       lambdaMin: number | null;
       lambdaMax: number;
     }[] = [];
-
-    // map from point ID to its current highest index in hierarchy:
     const pointToHierarchyIndex = new Map();
-
-    // to start, each point is in its own group (this is effectively our version of the MSText step)
-    const currentGroups = new Map(); // Map of current groups (both clusters and noise points). key: id of root of the group, value: array of ids in the group
+    const currentGroups = new Map();
     for (const key of this.X.map((point) => point.id)) {
       currentGroups.set(key, [key]);
     }
 
-    // Merge clusters based on sorted edges
     this.mstEdges.forEach((edge) => {
       const { from, to, weight } = edge;
       const rootFrom = uf.find(from);
@@ -216,37 +231,26 @@ class HDBSCAN<T extends VectorPoint> {
       const sizeTo = currentGroups.get(rootTo).length;
       const newSize = sizeFrom + sizeTo;
 
-      // merge two noise points to form a new cluster!
       uf.union(from, to);
-      //find what the root of the new cluster is
       const newRoot = uf.find(from);
-      // console.log("newRoot", newRoot);
       const newElements = currentGroups
         .get(rootFrom)
         .concat(currentGroups.get(rootTo));
 
       if (newSize >= this.mpts && sizeFrom < this.mpts && sizeTo < this.mpts) {
-        // merge two noise points to form a new cluster!
-
-        // push the new cluster to the hierarchy
         hierarchy.push({
-          childrenClusters: null, // first level cluster so no children
+          childrenClusters: null,
           elements: newElements,
           lambdaPs: new Array(newElements.length).fill(1 / weight),
-          lambdaMin: null, // we don't know yet!
+          lambdaMin: null,
           lambdaMax: 1 / weight,
         });
-
-        // update the root of the new cluster in the pointToHierarchyIndex map
         pointToHierarchyIndex.set(newRoot, hierarchy.length - 1);
       } else if (
         newSize >= this.mpts &&
         sizeFrom >= this.mpts &&
         sizeTo >= this.mpts
       ) {
-        // merge two clusters to form a new cluster!
-
-        // push the new cluster to the hierarchy
         hierarchy.push({
           childrenClusters: [
             pointToHierarchyIndex.get(rootFrom),
@@ -254,43 +258,33 @@ class HDBSCAN<T extends VectorPoint> {
           ],
           elements: newElements,
           lambdaPs: new Array(newElements.length).fill(1 / weight),
-          lambdaMin: null, // we don't know yet!
+          lambdaMin: null,
           lambdaMax: 1 / weight,
         });
-
-        //update the lambdaMin of the two children clusters
         hierarchy[pointToHierarchyIndex.get(rootFrom)].lambdaMin = 1 / weight;
         hierarchy[pointToHierarchyIndex.get(rootTo)].lambdaMin = 1 / weight;
-
-        // update the root of the new cluster in the pointToHierarchyIndex map
         pointToHierarchyIndex.set(newRoot, hierarchy.length - 1);
       } else if (newSize >= this.mpts) {
-        // merge a noise group with a cluster so a cluster grows bigger
-
         if (pointToHierarchyIndex.get(newRoot) === undefined) {
-          // this means union find for some reason made the noise group the new root, so we just assign the other group's hierarchy index
           const existingIndex =
             pointToHierarchyIndex.get(rootFrom) ??
             pointToHierarchyIndex.get(rootTo);
           pointToHierarchyIndex.set(newRoot, existingIndex);
         }
-        // find the existing cluster and modify it:
         const updateCluster = hierarchy[pointToHierarchyIndex.get(newRoot)];
         updateCluster.elements = newElements;
-        const mergeSize = sizeFrom < this.mpts ? sizeFrom : sizeTo; // the size of the group that was noise
+        const mergeSize = sizeFrom < this.mpts ? sizeFrom : sizeTo;
         for (let i = 0; i < mergeSize; i++) {
           updateCluster.lambdaPs.push(1 / weight);
         }
       }
       currentGroups.set(newRoot, newElements);
-      currentGroups.delete(newRoot === rootFrom ? rootTo : rootFrom); // merged into newRoot, so the merged in root no longer considered
+      currentGroups.delete(newRoot === rootFrom ? rootTo : rootFrom);
     });
 
-    // remove last element of hierarchy array bc we don't care about the root
     hierarchy.pop();
 
-    // creating and condensing the hierarchy tree is done! Now we calculate stabilities of every cluster:
-    const stabilities = new Array(hierarchy.length).fill(0); // index is the index in the hierarchy array, value is the stability
+    const stabilities = new Array(hierarchy.length).fill(0);
     for (let i = 0; i < hierarchy.length; i++) {
       for (let j = 0; j < hierarchy[i].lambdaPs.length; j++) {
         stabilities[i] +=
@@ -298,21 +292,14 @@ class HDBSCAN<T extends VectorPoint> {
       }
     }
 
-    // now we loop through the clusters again reverse topological order and set s_hat s.t.:
-    //  s_hat(cluster_i) =
-    //    {stabilities(cluster_i) iff cluster_i is leaf node
-    //    {max(cluster_i, s_hat(cluster_i_left_child) + s_hat(cluster_i_right_child)) otherwise
-    // and we select the cluster where its stability is greater than the sum of the s_hat values of its children
-
-    const isSelected = new Array(hierarchy.length).fill(false); //index is the index in the hierarchy array, boolean value is whether we select it as a cluster
-    const s_hat = new Array(hierarchy.length).fill(0); // index is the index in the hierarchy array, value is the s_hat value
+    const isSelected = new Array(hierarchy.length).fill(false);
+    const s_hat = new Array(hierarchy.length).fill(0);
     for (let i = 0; i < hierarchy.length; i++) {
       if (hierarchy[i].childrenClusters === null) {
-        //cluster_i is leaf node
         s_hat[i] = stabilities[i];
         isSelected[i] = true;
       } else {
-        const i_left_child_index = hierarchy[i].childrenClusters![0]; // since we remove the root, this must be defined
+        const i_left_child_index = hierarchy[i].childrenClusters![0];
         const i_right_child_index = hierarchy[i].childrenClusters![1];
         const i_left_child = s_hat[i_left_child_index];
         const i_right_child = s_hat[i_right_child_index];
@@ -323,25 +310,21 @@ class HDBSCAN<T extends VectorPoint> {
         } else {
           s_hat[i] = stabilities[i];
           isSelected[i] = true;
-
-          // unselect children here now that we've selected their parents
           isSelected[i_left_child_index] = false;
           isSelected[i_right_child_index] = false;
         }
       }
     }
 
-    const clusters: Array<Array<string>> = []; // Each cluster is an array of string ids (string[][])
-    const outliers: Array<string> = []; // List of outlier ids (string[])
+    const clusters: Array<Array<string>> = [];
+    const outliers: Array<string> = [];
 
-    //finally, loop through the hierarchy to find the clusters that we end up selecting!
     for (let i = 0; i < hierarchy.length; i++) {
       if (isSelected[i]) {
         clusters.push(hierarchy[i].elements);
       }
     }
 
-    // find the outliers now
     const allIds = new Set(this.X.map((point) => point.id));
     clusters.forEach((cluster) => {
       cluster.forEach((id) => {
@@ -354,128 +337,6 @@ class HDBSCAN<T extends VectorPoint> {
   }
 }
 
-export function euclidean(pointA: number[], pointB: number[]): number {
-  if (pointA.length !== pointB.length) {
-    throw new Error("unequal dimension in input data");
-  }
-  let sum = 0;
-  for (let i = 0; i < pointA.length; i++) {
-    const diff = pointA[i] - pointB[i];
-    sum += diff * diff;
-  }
-  return Math.sqrt(sum);
-}
-
-export function manhattan(pointA: number[], pointB: number[]): number {
-  if (pointA.length !== pointB.length) {
-    throw new Error("unequal dimension in input data");
-  }
-  let sum = 0;
-  for (let i = 0; i < pointA.length; i++) {
-    sum += Math.abs(pointA[i] - pointB[i]);
-  }
-  return sum;
-}
-
-export function cosine(pointA: number[], pointB: number[]): number {
-  if (pointA.length !== pointB.length) {
-    throw new Error("unequal dimension in input data");
-  }
-  let dotProduct = 0.0;
-  let normA = 0.0;
-  let normB = 0.0;
-  for (let i = 0; i < pointA.length; i++) {
-    dotProduct += pointA[i] * pointB[i];
-    normA += pointA[i] * pointA[i];
-    normB += pointB[i] * pointB[i];
-  }
-  if (normA === 0 || normB === 0) {
-    return 1;
-  }
-  const similarity = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-  return 1 - similarity;
-}
-
-class PriorityQueue<T> {
-  private _heap: T[];
-  private _comparator: (a: T, b: T) => boolean;
-
-  constructor(comparator: (a: T, b: T) => boolean) {
-    this._heap = [];
-    this._comparator = comparator;
-  }
-
-  enqueue(value: T): void {
-    this._heap.push(value);
-    this._siftUp();
-  }
-
-  dequeue(): T | null {
-    if (this.isEmpty()) {
-      return null;
-    }
-    const poppedValue = this._heap[0];
-    const bottomValue = this._heap.pop();
-    if (this._heap.length > 0 && bottomValue !== undefined) {
-      this._heap[0] = bottomValue;
-      this._siftDown();
-    }
-    return poppedValue;
-  }
-
-  isEmpty(): boolean {
-    return this._heap.length === 0;
-  }
-
-  private _siftUp(): void {
-    let nodeIdx = this._heap.length - 1;
-    while (
-      nodeIdx > 0 &&
-      this._comparator(
-        this._heap[nodeIdx],
-        this._heap[Math.floor((nodeIdx - 1) / 2)]
-      )
-    ) {
-      this._swap(nodeIdx, Math.floor((nodeIdx - 1) / 2));
-      nodeIdx = Math.floor((nodeIdx - 1) / 2);
-    }
-  }
-
-  private _siftDown(): void {
-    let nodeIdx = 0;
-    while (
-      (2 * nodeIdx + 1 < this._heap.length &&
-        this._comparator(this._heap[2 * nodeIdx + 1], this._heap[nodeIdx])) ||
-      (2 * nodeIdx + 2 < this._heap.length &&
-        this._comparator(this._heap[2 * nodeIdx + 2], this._heap[nodeIdx]))
-    ) {
-      const smallerChildIdx =
-        2 * nodeIdx + 2 < this._heap.length &&
-        this._comparator(
-          this._heap[2 * nodeIdx + 2],
-          this._heap[2 * nodeIdx + 1]
-        )
-          ? 2 * nodeIdx + 2
-          : 2 * nodeIdx + 1;
-      this._swap(nodeIdx, smallerChildIdx);
-      nodeIdx = smallerChildIdx;
-    }
-  }
-
-  private _swap(i: number, j: number): void {
-    [this._heap[i], this._heap[j]] = [this._heap[j], this._heap[i]];
-  }
-}
-
-/**
- * Finds the n most central elements in a cluster of vectors
- * @template T Type of cluster elements extending {id: string; vector: number[]}
- * @param cluster Array of objects containing at least {id, vector} properties
- * @param n Number of central elements to return (must be >= 1)
- * @param distanceFunction Optional distance function (defaults to cosine)
- * @returns Array of input objects with additional distance property, representing the n most central elements, sorted by distance from centroid
- * @throws Error if n < 1 or cluster is empty
- */
 export function findCentralElements<T extends VectorPoint>(
   cluster: T[],
   n: number,
@@ -505,7 +366,6 @@ export function findCentralElements<T extends VectorPoint>(
     centroid[i] /= vectors.length;
   }
 
-  // Find n closest points to centroid
   return cluster
     .map((point) => ({
       ...point,
@@ -513,48 +373,6 @@ export function findCentralElements<T extends VectorPoint>(
     }))
     .sort((a, b) => a.distance - b.distance)
     .slice(0, n);
-}
-
-//extended union-find data structure
-class UnionFind<T> {
-  private parent: Map<T, T>;
-  private rank: Map<T, number>;
-
-  constructor(elements: T[]) {
-    this.parent = new Map();
-    this.rank = new Map();
-
-    elements.forEach((e) => {
-      this.parent.set(e, e); // Each element is the parent of itself
-      this.rank.set(e, 0); // Rank of each element is 0 initially
-    });
-  }
-
-  find(item: T): T {
-    if (this.parent.get(item)! !== item) {
-      this.parent.set(item, this.find(this.parent.get(item)!));
-    }
-    return this.parent.get(item)!;
-  }
-
-  union(item1: T, item2: T): void {
-    const root1 = this.find(item1);
-    const root2 = this.find(item2);
-
-    if (root1 === root2) return;
-
-    const rank1 = this.rank.get(root1)!;
-    const rank2 = this.rank.get(root2)!;
-
-    if (rank1 > rank2) {
-      this.parent.set(root2, root1);
-    } else if (rank1 < rank2) {
-      this.parent.set(root1, root2);
-    } else {
-      this.parent.set(root2, root1);
-      this.rank.set(root1, rank1 + 1);
-    }
-  }
 }
 
 export default HDBSCAN;

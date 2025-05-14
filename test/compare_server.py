@@ -3,6 +3,9 @@ from hdbscan import HDBSCAN
 import numpy as np
 from flask_cors import CORS
 from sklearn.metrics.pairwise import cosine_similarity
+import time # Add this import
+import psutil # Add this import for memory usage
+import os # Add this import for process ID
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -16,6 +19,7 @@ def cluster():
     min_points = data['minPoints']
     distance_metric = data.get('distanceMetric', 'euclidean')  # Default to 'euclidean' if not provided
 
+    start_time = time.perf_counter() # Start timing
     if distance_metric == 'cosine':
         # Convert points to distance matrix using cosine distance
         similarity_matrix = cosine_similarity(points)
@@ -26,6 +30,14 @@ def cluster():
         clusterer = HDBSCAN(min_cluster_size=min_points, min_samples=min_points, metric=distance_metric)
         cluster_labels = clusterer.fit_predict(points)
     
+    end_time = time.perf_counter() # End timing
+    duration_ms = (end_time - start_time) * 1000 # Calculate duration in milliseconds
+
+    # Get memory usage
+    process = psutil.Process(os.getpid())
+    memory_rss_b = process.memory_info().rss  # in bytes
+    memory_rss_mb = memory_rss_b / (1024 * 1024) # convert to MB
+
     # Convert labels to same format as your TS implementation
     clusters = {}
     outliers = []
@@ -40,7 +52,9 @@ def cluster():
     
     return jsonify({
         'clusters': [cluster for cluster in clusters.values()],
-        'outliers': outliers
+        'outliers': outliers,
+        'duration_ms': duration_ms, # Add duration to response
+        'memory_rss_mb': memory_rss_mb # Add memory usage to response
     })
 
 if __name__ == '__main__':

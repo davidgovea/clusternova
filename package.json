@@ -32,5 +32,11 @@
   "bugs": {
     "url": "https://github.com/led101/clusternova/issues"
   },
-  "homepage": "https://github.com/led101/clusternova#readme"
+  "homepage": "https://github.com/led101/clusternova#readme",
+  "devDependencies": {
+    "@types/node": "^22.15.17"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0"
+  }
 }
